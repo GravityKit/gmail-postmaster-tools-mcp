@@ -30,7 +30,8 @@
       ],
       "env": {
         "GPT_CLIENT_ID": "${user_config.google_client_id}",
-        "GPT_CLIENT_SECRET": "${user_config.google_client_secret}"
+        "GPT_CLIENT_SECRET": "${user_config.google_client_secret}",
+        "GPT_SCOPE": "${user_config.google_scope}"
       }
     }
   },
@@ -47,6 +48,13 @@
       "description": "The client secret for the same Desktop app OAuth client. Stored locally; required by Google even for desktop apps.",
       "required": true,
       "sensitive": true
+    },
+    "google_scope": {
+      "type": "string",
+      "title": "Google permissions (advanced)",
+      "description": "Leave as is for read-only traffic data. To turn on list_domains and get_domain, add a space and https://www.googleapis.com/auth/postmaster.domain. That permission also allows creating, verifying and deleting domains. After changing this, run gpt_authenticate again.",
+      "required": false,
+      "default": "https://www.googleapis.com/auth/postmaster.traffic.readonly"
     }
   },
   "tools": [
@@ -64,11 +72,11 @@
     },
     {
       "name": "list_domains",
-      "description": "List domains registered in your Postmaster Tools account. Off unless GPT_SCOPE includes the domain scope."
+      "description": "List domains registered in your Postmaster Tools account. Off unless the Google permissions setting includes the domain scope."
     },
     {
       "name": "get_domain",
-      "description": "Get metadata for one registered domain. Off unless GPT_SCOPE includes the domain scope."
+      "description": "Get metadata for one registered domain. Off unless the Google permissions setting includes the domain scope."
     },
     {
       "name": "get_compliance_status",

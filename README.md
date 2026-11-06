@@ -130,8 +130,9 @@ things, but the token could, so those two tools stay hidden unless you set:
 GPT_SCOPE="https://www.googleapis.com/auth/postmaster.traffic.readonly https://www.googleapis.com/auth/postmaster.domain"
 ```
 
-The server refuses to start with any other scope. Changing `GPT_SCOPE` requires
-running `gpt_authenticate` again.
+In a `.mcpb` install, put the same value in the extension's **Google permissions**
+setting. The server refuses to start with any other scope. Changing the scope
+requires running `gpt_authenticate` again.
 
 ### Token lifetime (important)
 

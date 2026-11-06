@@ -29,7 +29,9 @@ const SCOPE_DOMAIN = 'https://www.googleapis.com/auth/postmaster.domain';
 const ALLOWED_SCOPES = [SCOPE_TRAFFIC, SCOPE_DOMAIN];
 
 function resolveScopes(raw) {
-  const requested = (raw || SCOPE_TRAFFIC).split(/\s+/).filter(Boolean);
+  // An MCP host may pass an unset optional setting as its literal placeholder.
+  const isUnresolvedPlaceholder = /^\$\{user_config\.[^}]*\}$/.test(raw || '');
+  const requested = (isUnresolvedPlaceholder || !raw ? SCOPE_TRAFFIC : raw).split(/\s+/).filter(Boolean);
   const rejected = requested.filter((scope) => !ALLOWED_SCOPES.includes(scope));
   if (rejected.length > 0 || requested.length === 0) {
     throw new Error(

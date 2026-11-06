@@ -226,6 +226,15 @@ withServer('domain tools appear only when GPT_SCOPE asks for them', { GPT_SCOPE:
   assert.ok(tools.every((t) => t.requiredScope === undefined));
 });
 
+withServer('an unfilled bundle setting falls back to traffic read-only', { GPT_SCOPE: '${user_config.google_scope}' }, async (srv) => {
+  const names = (await srv.rpc('tools/list')).result.tools.map((t) => t.name);
+  assert.ok(names.includes('query_domain_stats'));
+  assert.ok(!names.includes('list_domains'));
+  srv.tool('gpt_authenticate');
+  const url = await loginUrl(srv);
+  assert.equal(url.searchParams.get('scope'), TRAFFIC);
+});
+
 for (const scope of ['https://www.googleapis.com/auth/postmaster', 'https://www.googleapis.com/auth/postmaster.user']) {
   test(`refuses to start with scope ${scope}`, { timeout: TEST_TIMEOUT_MS }, async () => {
     const mock = await startMock();
