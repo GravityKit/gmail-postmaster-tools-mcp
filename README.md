@@ -9,19 +9,16 @@ An [MCP](https://modelcontextprotocol.io) server for the **Gmail Postmaster
 Tools API (v2)** — query your domains, sender compliance status, and Gmail
 traffic metrics from Claude, Cursor, or any MCP client.
 
-This is a **bring-your-own-credentials** tool for hands-on senders: you supply
-your own Google OAuth client, and the server runs the sign-in locally. Nothing
-is hosted and no data leaves your machine.
+This is a **bring-your-own-credentials** tool: you supply your own Google OAuth
+client, and the server runs the sign-in locally. Nothing is hosted. The server
+talks only to Google; what it returns goes to your MCP client and its model.
 
-> Want this without setting up a Google Cloud project? That's what
-> **[Postmaster+](https://postmasterplus.com)** is for — hosted, multi-provider
-> (Gmail + Outlook + more), with verification, history, and alerting.
-
-Built & maintained by the **[Postmaster+](https://postmasterplus.com)** team at **[OptiPub](https://optipub.com)**.
+GravityKit's fork of [optipub/gmail-postmaster-tools-mcp](https://github.com/optipub/gmail-postmaster-tools-mcp),
+hardened for security and with a test suite. See [What this fork changes](#what-this-fork-changes).
 
 ## What you get
 
-- `list_domains` / `get_domain` — your registered domains and their verification state
+- `list_domains` / `get_domain` — your registered domains and their verification state (off by default, see [Scopes](#how-authentication-works))
 - `get_compliance_status` — SPF, DKIM, DMARC, alignment, message formatting, DNS records, TLS encryption, user-reported spam rate, and one-click / honored unsubscribe verdicts
 - `query_domain_stats` — spam rate, auth success (SPF/DKIM/DMARC), TLS encryption rate, delivery errors, and feedback-loop metrics over any date range
 - `gpt_authenticate` / `gpt_auth_status` / `gpt_sign_out`
@@ -83,13 +80,13 @@ and most other clients use the same `command` + `args` + `env` shape — only th
 config file location differs. Other env overrides are listed under
 [Configuration](#configuration-env-overrides).
 
-The first tool call (or `gpt_authenticate`) opens your browser for the Google
-sign-in; the `127.0.0.1` loopback works on any local desktop client.
+The `gpt_authenticate` tool opens your browser for the Google sign-in; the
+`127.0.0.1` loopback works on any local desktop client. Other tools never open a
+browser: they tell you to run `gpt_authenticate` when sign-in is needed.
 
 > **Remote-only clients (e.g. Perplexity, ChatGPT connectors):** these accept
 > only a remote HTTPS MCP server URL, not a local command, so this stdio build
-> can't be added directly. That would require hosting it — which is what
-> [Postmaster+](https://postmasterplus.com) provides.
+> can't be added directly.
 
 ## Usage examples
 
@@ -97,11 +94,19 @@ sign-in; the `127.0.0.1` loopback works on any local desktop client.
 - "List my Postmaster domains" → `list_domains`
 - "Is example.com compliant with Gmail's sender rules?" → `get_compliance_status { domain: "example.com" }`
 - "Spam rate for example.com over the last 30 days" → `query_domain_stats { domain: "example.com", start_date: "...", end_date: "...", metrics: ["SPAM_RATE"] }`
-- "DKIM auth success for example.com" → `query_domain_stats { domain: "example.com", metrics: [{ "standardMetric": "AUTH_SUCCESS_RATE", "filter": "auth_type=\"dkim\"" }] }`
+- "DKIM auth success for example.com" → `query_domain_stats { domain: "example.com", metrics: [{ "standardMetric": "AUTH_SUCCESS_RATE", "filter": "auth_type = \"dkim\"" }] }`
 
-Some metrics require a filter: `AUTH_SUCCESS_RATE` (`auth_type=spf|dkim|dmarc`),
-`TLS_ENCRYPTION_RATE` (`traffic_direction=inbound|outbound`),
-`DELIVERY_ERROR_RATE` (optional `error_type=...`). `SPAM_RATE` needs none.
+Filters, from Google's API definition:
+
+| Metric | Filter |
+| --- | --- |
+| `SPAM_RATE` | none |
+| `AUTH_SUCCESS_RATE` | required: `auth_type = "spf"`, `"dkim"` or `"dmarc"` |
+| `TLS_ENCRYPTION_RATE`, `TLS_ENCRYPTION_MESSAGE_COUNT` | required: `traffic_direction = "inbound"` or `"outbound"` |
+| `DELIVERY_ERROR_RATE`, `DELIVERY_ERROR_COUNT` | optional: `error_type = "reject"` or `"temp_fail"` |
+| `FEEDBACK_LOOP_SPAM_RATE` | required: `feedback_loop_id = "<id>"` |
+
+`query_domain_stats` reads every page of results, up to 25 pages of 200 rows.
 
 ## How authentication works
 
@@ -112,12 +117,22 @@ the code, and exchanges it (with your client secret + PKCE verifier) for tokens.
 
 Google requires a client secret even for desktop apps, which is why both values
 are needed. Tokens are stored only on your machine at
-`~/.gmail-postmaster-mcp/tokens.json` (`0600`) and are git-ignored.
+`~/.gmail-postmaster-mcp/tokens.json` (`0600`, in a `0700` folder).
+`gpt_sign_out` revokes the access at Google and deletes that file.
 
-**Scopes:** by default the server requests
-`postmaster.traffic.readonly` (metrics + compliance) and `postmaster.domain`
-(list/get domains). Override with the `GPT_SCOPE` env var if you want to narrow
-it (e.g. traffic-only, dropping `list_domains`/`get_domain`).
+**Scopes:** by default the server requests only `postmaster.traffic.readonly`,
+which covers metrics and compliance. `list_domains` and `get_domain` need
+`postmaster.domain`, which Google describes as "View and manage" and which also
+allows creating, verifying and deleting domains. This server never does those
+things, but the token could, so those two tools stay hidden unless you set:
+
+```
+GPT_SCOPE="https://www.googleapis.com/auth/postmaster.traffic.readonly https://www.googleapis.com/auth/postmaster.domain"
+```
+
+In a `.mcpb` install, put the same value in the extension's **Google permissions**
+setting. The server refuses to start with any other scope. Changing the scope
+requires running `gpt_authenticate` again.
 
 ### Token lifetime (important)
 
@@ -144,8 +159,7 @@ production** (Google Auth Platform → Audience → Publish app). Notes for the
 | --- | --- | --- |
 | `GPT_CLIENT_ID` | Google OAuth client ID (required) | — |
 | `GPT_CLIENT_SECRET` | Google OAuth client secret (required) | — |
-| `GPT_SCOPE` | Space-separated OAuth scopes | traffic.readonly + domain |
-| `GPT_API_BASE` | API base URL | `https://gmailpostmastertools.googleapis.com/v2` |
+| `GPT_SCOPE` | Space-separated OAuth scopes (allowed: traffic.readonly, domain) | traffic.readonly |
 | `GPT_TOKEN_DIR` | Token cache directory | `~/.gmail-postmaster-mcp` |
 | `GPT_LOGIN_TIMEOUT_MS` | Sign-in wait | `180000` |
 | `GPT_REQUEST_TIMEOUT_MS` | Per-request timeout | `60000` |
@@ -157,8 +171,37 @@ npx @anthropic-ai/mcpb validate manifest.json
 npx @anthropic-ai/mcpb pack . gmail-postmaster-tools.mcpb
 ```
 
-Pushing a `vX.Y.Z` tag triggers CI to pack, attach the `.mcpb` to a GitHub
-Release, and publish to the MCP Registry.
+Pushing a `vX.Y.Z` tag that matches `manifest.json` makes CI run the tests, pack,
+and attach the `.mcpb` to a GitHub Release. This fork does not publish to the MCP
+Registry.
+
+## Tests
+
+```bash
+npm test            # local, against a fake Google server
+npm run test:live   # Google's real endpoints with made-up credentials; needs no account
+```
+
+## What this fork changes
+
+Security:
+- Removed the `GPT_API_BASE`, `GPT_TOKEN_URL` and `GPT_AUTHORIZE_URL` settings, which could send tokens and the client secret to another host.
+- Default permission is read-only traffic data; the "View and manage" domain scope is opt-in, and wider scopes are refused.
+- The sign-in callback checks `state` first, so a stray request can't end a sign-in, and it escapes what it shows.
+- Token files are written atomically in a `0700` folder. Sign-out revokes at Google.
+- Tokens saved with different permissions are not reused.
+- Time and size limits on every Google request, and token-endpoint errors show only Google's error fields.
+- Release workflow: actions pinned to commits, least permissions, no registry publishing.
+
+Bugs:
+- `query_domain_stats` returned only the first 10 rows with no way to get the rest. It now reads every page.
+- A malformed request to the sign-in callback, or a missing browser command, crashed the server.
+- HTTP errors from Google weren't marked as errors, and a hung token request never ended.
+- February 31 was accepted as a date, and start dates after end dates reached Google.
+- An `end_date` alone could produce a backwards range.
+- A 401 no longer forces a new sign-in when a refresh would work.
+- Characters split across network chunks were corrupted.
+- JSON-RPC: parse errors, unknown tools, notifications and protocol version negotiation now follow the spec, and answers in progress are sent when input closes.
 
 ## Why zero dependencies
 
@@ -171,7 +214,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE) © OptiPub
+[MIT](LICENSE) © OptiPub. Original work by Kyle Renfrow at OptiPub; fork changes by GravityKit.
 
 ---
 

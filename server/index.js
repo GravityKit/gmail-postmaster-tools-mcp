@@ -14,8 +14,11 @@ const auth = require('./auth');
 const gpt = require('./gpt');
 
 const SERVER_NAME = 'gmail-postmaster-tools';
-const SERVER_VERSION = '1.0.1';
+const { version: SERVER_VERSION } = require('./package.json');
 const PROTOCOL_VERSION = '2025-06-18';
+const SUPPORTED_PROTOCOL_VERSIONS = [PROTOCOL_VERSION, '2025-03-26', '2024-11-05'];
+const SHUTDOWN_WAIT_MS = 5000;
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
 
 const TOOLS = [
   {
@@ -31,16 +34,18 @@ const TOOLS = [
   },
   {
     name: 'gpt_sign_out',
-    description: 'Delete the cached Google tokens (sign out).',
+    description: 'Sign out: revoke the Google access and delete the cached tokens.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     name: 'list_domains',
+    requiredScope: auth.SCOPE_DOMAIN,
+    annotations: READ_ONLY,
     description: 'List the domains registered in your Gmail Postmaster Tools account, with verification state and your permission level. Calls GET /v2/domains.',
     inputSchema: {
       type: 'object',
       properties: {
-        pageSize: { type: 'number', description: 'Optional max number of domains (default 10, max 200).' },
+        pageSize: { type: 'integer', description: 'Optional max number of domains per page (default 10, max 200).' },
         pageToken: { type: 'string', description: 'Optional page token from a previous call.' },
       },
       additionalProperties: false,
@@ -48,6 +53,8 @@ const TOOLS = [
   },
   {
     name: 'get_domain',
+    requiredScope: auth.SCOPE_DOMAIN,
+    annotations: READ_ONLY,
     description: 'Get metadata for a single registered domain (verification state, permission, timestamps). Calls GET /v2/domains/{domain}.',
     inputSchema: {
       type: 'object',
@@ -60,6 +67,8 @@ const TOOLS = [
   },
   {
     name: 'get_compliance_status',
+    requiredScope: auth.SCOPE_TRAFFIC,
+    annotations: READ_ONLY,
     description: 'Get the sender compliance status for a domain — verdicts for SPF, DKIM, DMARC, alignment, message formatting, DNS records, encryption, user-reported spam rate, and one-click / honored unsubscribe. Calls GET /v2/domains/{domain}/complianceStatus.',
     inputSchema: {
       type: 'object',
@@ -72,18 +81,21 @@ const TOOLS = [
   },
   {
     name: 'query_domain_stats',
+    requiredScope: auth.SCOPE_TRAFFIC,
+    annotations: READ_ONLY,
     description:
-      'Query Gmail traffic metrics for a domain over a date range. Metrics include SPAM_RATE, AUTH_SUCCESS_RATE (filter auth_type=spf|dkim|dmarc), TLS_ENCRYPTION_RATE (filter traffic_direction=inbound|outbound), DELIVERY_ERROR_RATE/COUNT (optional filter error_type=...), FEEDBACK_LOOP_SPAM_RATE/ID. Defaults to SPAM_RATE over the last ~7 days, daily. Calls POST /v2/domains/{domain}/domainStats:query.',
+      'Query Gmail traffic metrics for a domain over a date range, reading every page of results. Metrics: SPAM_RATE; AUTH_SUCCESS_RATE (filter required: auth_type = "spf", "dkim" or "dmarc"); TLS_ENCRYPTION_RATE and TLS_ENCRYPTION_MESSAGE_COUNT (filter required: traffic_direction = "inbound" or "outbound"); DELIVERY_ERROR_RATE and DELIVERY_ERROR_COUNT (optional filter: error_type = "reject" or "temp_fail"); FEEDBACK_LOOP_ID; FEEDBACK_LOOP_SPAM_RATE (filter required: feedback_loop_id = "<id>"). Defaults to SPAM_RATE, daily, for the 7 days ending yesterday. Google returns only dates that have data. Calls POST /v2/domains/{domain}/domainStats:query.',
     inputSchema: {
       type: 'object',
       properties: {
         domain: { type: 'string', description: 'Fully-qualified domain name, e.g. example.com.' },
-        start_date: { type: 'string', description: 'Start date yyyy-MM-dd (inclusive). Defaults to ~8 days ago.' },
+        start_date: { type: 'string', description: 'Start date yyyy-MM-dd (inclusive). Defaults to 6 days before end_date.' },
         end_date: { type: 'string', description: 'End date yyyy-MM-dd (inclusive). Defaults to yesterday.' },
         granularity: { type: 'string', enum: ['DAILY', 'OVERALL'], description: 'DAILY (per-day) or OVERALL (totals for the period). Default DAILY.' },
+        pageToken: { type: 'string', description: 'Only needed if a previous result returned nextPageToken because it stopped early.' },
         metrics: {
           type: 'array',
-          description: 'Metrics to fetch. Each item is either a standard metric name (string) or an object { standardMetric, filter, name }. Metrics like AUTH_SUCCESS_RATE and TLS_ENCRYPTION_RATE require a filter. Defaults to ["SPAM_RATE"].',
+          description: 'Metrics to fetch. Each item is either a standard metric name (string) or an object { standardMetric, filter, name }. Defaults to ["SPAM_RATE"].',
           items: {
             anyOf: [
               { type: 'string' },
@@ -107,20 +119,45 @@ const TOOLS = [
   },
 ];
 
+function availableTools() {
+  return TOOLS.filter((tool) => !tool.requiredScope || auth.hasScope(tool.requiredScope));
+}
+
+function publicTool({ requiredScope, ...tool }) {
+  return tool;
+}
+
 function formatResponse(resp, label) {
-  if (resp.status >= 200 && resp.status < 300) {
+  const isSuccess = resp.status >= 200 && resp.status < 300;
+  if (isSuccess) {
     let parsed;
     try { parsed = JSON.parse(resp.body); } catch (_) { parsed = null; }
     const payload = parsed !== null ? JSON.stringify(parsed, null, 2) : (resp.body || '(empty body)');
-    return `${label}: HTTP ${resp.status}\n\n${payload}`;
+    const isEmptyStats = parsed !== null && Array.isArray(parsed.domainStats) && parsed.domainStats.length === 0;
+    const note = isEmptyStats ? '\n\nNo data for this range. Google returns only dates that have data.' : '';
+    return { text: `${label}: HTTP ${resp.status}\n\n${payload}${note}`, isError: false };
   }
-  if (resp.status === 404) return `${label}: HTTP 404 Not Found — domain not registered by you, or no data.`;
-  if (resp.status === 403) return `${label}: HTTP 403 — access denied. Check the error body below for the reason (e.g. SERVICE_DISABLED = enable the Postmaster Tools API on this project; PERMISSION_DENIED / access not configured = project not on the v2 preview allowlist or wrong project; ACCESS_TOKEN_SCOPE_INSUFFICIENT = re-run gpt_authenticate to widen scope).\n${resp.body || '(empty body)'}`.trim();
-  if (resp.status === 400) return `${label}: HTTP 400 Bad Request.\n${resp.body || ''}`.trim();
-  return `${label}: HTTP ${resp.status}\n${resp.body || ''}`.trim();
+  const body = resp.body || '(empty body)';
+  const hints = {
+    400: 'Bad Request.',
+    403: 'access denied. Common reasons in the body: SERVICE_DISABLED (turn on the Postmaster Tools API in this Google Cloud project), PERMISSION_DENIED (this Google account has no access to the domain), ACCESS_TOKEN_SCOPE_INSUFFICIENT (run gpt_authenticate again).',
+    404: 'Not Found. The domain is not registered by this Google account, or there is no data.',
+  };
+  const hint = hints[resp.status] ? ` — ${hints[resp.status]}` : '';
+  return { text: `${label}: HTTP ${resp.status}${hint}\n${body}`.trim(), isError: true };
 }
 
 function fmtTime(ms) { try { return new Date(ms).toISOString(); } catch (_) { return String(ms); } }
+
+function validateArguments(tool, args) {
+  const isObject = args !== null && typeof args === 'object' && !Array.isArray(args);
+  if (!isObject) throw new Error('Tool arguments must be an object.');
+  const allowed = Object.keys(tool.inputSchema.properties);
+  const unknown = Object.keys(args).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown argument: ${unknown.join(', ')}. Allowed: ${allowed.join(', ') || '(none)'}.`);
+  }
+}
 
 async function callTool(name, args) {
   switch (name) {
@@ -131,14 +168,21 @@ async function callTool(name, args) {
     }
     case 'gpt_auth_status': {
       if (!auth.hasCreds()) return auth.SETUP_HELP;
-      const cache = auth.loadCache();
-      if (!cache) return 'Not signed in. Run gpt_authenticate to sign in.';
       const silent = await auth.getAccessTokenSilent();
-      if (silent.ok) return `Signed in. Access token valid until ${fmtTime(silent.expires_at)} (auto-refresh enabled).`;
-      return `Cached session is no longer usable (${silent.reason}${silent.error ? ': ' + silent.error : ''}). Run gpt_authenticate again.`;
+      if (!silent.ok) return auth.describeSignInProblem(silent);
+      const refreshNote = silent.has_refresh_token ? 'auto-refresh enabled' : 'no refresh token, so sign in again when it expires';
+      return `Signed in. Access token valid until ${fmtTime(silent.expires_at)} (${refreshNote}). Permissions: ${auth.SCOPE}`;
     }
-    case 'gpt_sign_out':
-      return auth.clearCache() ? 'Signed out — cached tokens deleted.' : 'No cached tokens to remove.';
+    case 'gpt_sign_out': {
+      const result = await auth.signOut();
+      if (!result.hadTokens) return 'No cached tokens to remove.';
+      if (result.revoked) return 'Signed out — Google access revoked and cached tokens deleted.';
+      const reason = result.revokeError ? ` (${result.revokeError})` : '';
+      return {
+        text: `Cached tokens deleted, but Google did not confirm the revoke${reason}. Remove access at https://myaccount.google.com/permissions if needed.`,
+        isError: true,
+      };
+    }
     case 'list_domains':
       return formatResponse(await gpt.listDomains(args), 'Registered domains');
     case 'get_domain':
@@ -158,57 +202,93 @@ function send(msg) { process.stdout.write(JSON.stringify(msg) + '\n'); }
 function sendResult(id, result) { send({ jsonrpc: '2.0', id, result }); }
 function sendError(id, code, message) { send({ jsonrpc: '2.0', id, error: { code, message } }); }
 
+async function handleToolCall(id, params) {
+  const toolName = params && params.name;
+  const tool = availableTools().find((candidate) => candidate.name === toolName);
+  if (!tool) {
+    sendError(id, -32602, `Unknown tool: ${toolName}`);
+    return;
+  }
+  const args = (params && params.arguments) || {};
+  try {
+    validateArguments(tool, args);
+    const output = await callTool(toolName, args);
+    const { text, isError } = typeof output === 'string' ? { text: output, isError: false } : output;
+    sendResult(id, { content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) });
+  } catch (e) {
+    sendResult(id, { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
+  }
+}
+
 async function handleMessage(msg) {
-  if (!msg || msg.jsonrpc !== '2.0') return;
+  const isValid = msg !== null && typeof msg === 'object' && msg.jsonrpc === '2.0' && typeof msg.method === 'string';
+  if (!isValid) {
+    const invalidId = msg && msg.id !== undefined ? msg.id : null;
+    sendError(invalidId, -32600, 'Invalid request.');
+    return;
+  }
   const { id, method, params } = msg;
+  // A message with no id is a notification, which must never get a response.
   const isRequest = id !== undefined && id !== null;
+  if (!isRequest) return;
   try {
     switch (method) {
-      case 'initialize':
+      case 'initialize': {
+        const asked = params && params.protocolVersion;
+        const isSupported = SUPPORTED_PROTOCOL_VERSIONS.includes(asked);
         sendResult(id, {
-          protocolVersion: (params && params.protocolVersion) || PROTOCOL_VERSION,
+          protocolVersion: isSupported ? asked : PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
         });
         return;
-      case 'notifications/initialized':
-      case 'initialized':
-        return;
+      }
       case 'ping':
-        if (isRequest) sendResult(id, {});
+        sendResult(id, {});
         return;
       case 'tools/list':
-        sendResult(id, { tools: TOOLS });
+        sendResult(id, { tools: availableTools().map(publicTool) });
         return;
-      case 'tools/call': {
-        const toolName = params && params.name;
-        const toolArgs = (params && params.arguments) || {};
-        try {
-          const text = await callTool(toolName, toolArgs);
-          sendResult(id, { content: [{ type: 'text', text }] });
-        } catch (e) {
-          sendResult(id, { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
-        }
+      case 'tools/call':
+        await handleToolCall(id, params);
         return;
-      }
       default:
-        if (isRequest) sendError(id, -32601, `Method not found: ${method}`);
-        return;
+        sendError(id, -32601, `Method not found: ${method}`);
     }
   } catch (e) {
-    if (isRequest) sendError(id, -32603, `Internal error: ${e.message}`);
+    sendError(id, -32603, `Internal error: ${e.message}`);
   }
 }
+
+const pending = new Set();
+function track(promise) {
+  pending.add(promise);
+  promise.finally(() => pending.delete(promise));
+}
+
+process.stdout.on('error', (e) => {
+  if (e.code === 'EPIPE') process.exit(0);
+});
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
   const t = line.trim();
   if (!t) return;
   let msg;
-  try { msg = JSON.parse(t); } catch (_) { return; }
-  if (Array.isArray(msg)) msg.forEach(handleMessage);
-  else handleMessage(msg);
+  try {
+    msg = JSON.parse(t);
+  } catch (_) {
+    sendError(null, -32700, 'Parse error.');
+    return;
+  }
+  const messages = Array.isArray(msg) ? msg : [msg];
+  messages.forEach((one) => track(handleMessage(one)));
 });
-rl.on('close', () => process.exit(0));
+rl.on('close', () => {
+  // A client may close its input and still read answers already asked for, but
+  // an open sign-in must not keep a finished process alive.
+  const timeout = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_WAIT_MS));
+  Promise.race([Promise.allSettled([...pending]), timeout]).then(() => process.exit(0));
+});
 
-process.stderr.write(`[Gmail Postmaster MCP] ${SERVER_NAME} v${SERVER_VERSION} ready (creds ${auth.hasCreds() ? 'configured' : 'MISSING'}, API ${gpt.API_BASE}).\n`);
+process.stderr.write(`[Gmail Postmaster MCP] ${SERVER_NAME} v${SERVER_VERSION} ready (creds ${auth.hasCreds() ? 'configured' : 'MISSING'}, permissions: ${auth.SCOPE}).\n`);

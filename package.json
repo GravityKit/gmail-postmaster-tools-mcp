@@ -1,0 +1,9 @@
+{
+  "name": "gmail-postmaster-tools-mcp-dev",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/server.test.js",
+    "test:live": "node --test test/live.test.js"
+  }
+}
