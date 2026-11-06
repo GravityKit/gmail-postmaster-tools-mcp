@@ -10,7 +10,9 @@ server/
   index.js             # MCP stdio server + tool definitions/dispatch
   auth.js              # Google OAuth (auth-code + PKCE, 127.0.0.1 loopback), token cache
   gpt.js               # Gmail Postmaster Tools API v2 REST client
-.github/workflows/     # CI: pack + attach .mcpb + publish to MCP Registry on tags
+  http-client.js       # The HTTPS call: no redirects, time and size limits
+test/                  # npm test (fake Google), npm run test:live (real endpoints)
+.github/workflows/     # ci.yml: tests. release.yml: pack + attach .mcpb on tags
 ```
 
 The runtime has **zero dependencies** — only Node.js built-ins (`http`, `https`,
@@ -43,12 +45,12 @@ npx @anthropic-ai/mcpb pack . gmail-postmaster-tools.mcpb
 Bump `version` in `manifest.json` and `server/package.json`, commit, then tag:
 
 ```bash
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
-CI validates, packs, attaches the `.mcpb` to the release, and publishes to the
-MCP Registry (hash computed in CI; OIDC auth).
+CI runs the tests, checks the tag matches `manifest.json`, packs, and attaches the
+`.mcpb` to the release.
 
 ## Guidelines
 
